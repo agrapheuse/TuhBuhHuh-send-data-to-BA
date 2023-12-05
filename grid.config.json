@@ -1,0 +1,11 @@
+{
+    "name": "Berlin",
+    "zoneDef":{
+        "gridStartLat": "52.5730",
+        "gridStartLong": "13.2770",
+        "gridEndLat": "52.39290011580509",
+        "gridEndLong": "13.571993619688197"
+    },
+    "zoneSize": "20",
+    "squareSize": "0.5"
+}
