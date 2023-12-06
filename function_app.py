@@ -5,8 +5,21 @@ import os
 from azure.storage.blob import BlobServiceClient
 from io import StringIO
 import pandas as pd
+import json
+import uuid
+from enum import Enum
 
 app = func.FunctionApp()
+
+# event header class
+class EventCatalog(Enum):
+    NEW_SENSOR_DATA = 'NEW_SENSOR_DATA'
+
+class EventHeader:
+    def __init__(self, eventID, eventCatalog):
+        self.eventID = eventID
+        self.eventCatalog = eventCatalog
+
 
 # function triggers on a timer every 15 minutes
 @app.function_name(name="sendDataToBA")
@@ -49,14 +62,28 @@ def send_data_to_queue():
         df = download_blob_to_file(blob_service_client, "csv", b.name)
         new_data.append(df)
         logging.info(f"downloaded {b.name}")
+
     
     # concatenate all the dataframes into one big dataframe
     concatenated_data = concatenate_new_data(grid, new_data)
 
-    # convert the dataframe to json and send it to the queue
-    json_string = concatenated_data.to_json(orient='records', lines=True)
-    channel.basic_publish(exchange='', routing_key=queue_name, body=json_string)
-    print(json_string)
+    # convert the dataframe to dict
+    data_list = concatenated_data.to_dict(orient='records')
+
+    # create the event message
+    event_header = EventHeader(uuid.uuid4(), EventCatalog.NEW_SENSOR_DATA)
+    event_message_dict = {
+        "eventHeader": {
+            "eventID": str(event_header.eventID),
+            "eventCatalog": event_header.eventCatalog.value
+        },
+        "eventBody": f"{json.dumps(data_list)}"
+    }
+    # convert the event message to json
+    json_payload = json.dumps(event_message_dict)
+
+    # send the event message to the queue
+    channel.basic_publish(exchange='', routing_key=queue_name, body=json_payload)
     logging.info(f"sent new data to queue {queue_name}")
 
     # close the connection
@@ -72,7 +99,7 @@ def download_blob_to_file(blob_service_client: BlobServiceClient, container_name
 
 def concatenate_new_data(grid, new_data):
     # create a dataframe with the right columns
-    columns = ["square_uuid", "timestamp", "valueType", "value"]
+    columns = ["squareUUID", "timestamp", "valueType", "value"]
     concatenated_data = pd.DataFrame(columns=columns)
 
     # loop through all the squares in the grid
@@ -91,7 +118,7 @@ def concatenate_new_data(grid, new_data):
             # add those rows to the new dataframe
             for index, data_row in data_in_square.iterrows():
                 concatenated_data.loc[len(concatenated_data)] = {
-                    "square_uuid": grid_row["uuid"],
+                    "squareUUID": grid_row["uuid"],
                     "timestamp": data_row["timestamp"],
                     "valueType": data_row["valueType"],
                     "value": data_row["sensorDataValue"]
