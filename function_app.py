@@ -8,6 +8,7 @@ import pandas as pd
 import json
 import uuid
 from enum import Enum
+from datetime import datetime
 
 app = func.FunctionApp()
 
@@ -27,7 +28,12 @@ class EventHeader:
               use_monitor=False) 
 def sendDataToBA(myTimer: func.TimerRequest) -> None:
     logging.info('Python timer trigger function executed.')
-    send_data_to_queue()
+    df = send_data_to_queue()
+    if df.empty:
+        return
+    pivoted_df = pivot_df(df)
+    upload_aggregated_data(pivoted_df)
+    delete_latest_folder()
 
 def send_data_to_queue():
     # connect to rabbitmq using the right credentials
@@ -51,7 +57,10 @@ def send_data_to_queue():
 
     # get all the blobs names in the csv container
     container_client = blob_service_client.get_container_client("csv")
-    blobs = container_client.list_blobs()
+    blobs = container_client.list_blobs(name_starts_with="latest/")
+    if len(list(blobs)) == 0:
+        logging.info("no new data found")
+        return pd.DataFrame()
     
     # get the grid from the blob storage
     grid = download_blob_to_file(blob_service_client, "grid", "grid.csv")
@@ -88,6 +97,7 @@ def send_data_to_queue():
 
     # close the connection
     connection.close()
+    return concatenated_data
 
 def download_blob_to_file(blob_service_client: BlobServiceClient, container_name, blob_name):
     blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
@@ -106,13 +116,15 @@ def concatenate_new_data(grid, new_data):
     for index, grid_row in grid.iterrows():
         # loop through all the dataframes
         for df in new_data:
+            df.replace("P1", "PM10", inplace=True)
+            df.replace("P2", "PM25", inplace=True)
 
             # filter all the rows that contain data that are in the square
             data_in_square = df[
-                (df["latitude"] < grid_row["latStart"]) & 
-                (df["latitude"] > grid_row["latEnd"]) & 
-                (df["longitude"] > grid_row["longStart"]) & 
-                (df["longitude"] < grid_row["longEnd"])
+                (df["latitude"] < grid_row["top_left_lat"]) & 
+                (df["latitude"] > grid_row["bottom_right_lat"]) & 
+                (df["longitude"] > grid_row["top_left_long"]) & 
+                (df["longitude"] < grid_row["bottom_right_long"])
                 ]
             
             # add those rows to the new dataframe
@@ -124,3 +136,39 @@ def concatenate_new_data(grid, new_data):
                     "value": data_row["sensorDataValue"]
                 }
     return concatenated_data
+
+def pivot_df(df):
+    pivoted_df = df.pivot_table(index=["squareUUID", "timestamp"], columns="valueType", values="value", aggfunc="first")
+    pivoted_df.reset_index(inplace=True)
+    return pivoted_df
+
+def upload_aggregated_data(df):
+    connection_string = os.environ["MyStorageAccountConnection"]
+    blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+
+    squares = df["squareUUID"].unique()
+    for square in squares:
+        square_df = df[df["squareUUID"] == square]
+        time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        csv_string = square_df.to_csv(index=False)
+        blob_client = blob_service_client.get_blob_client(container="csv/history", blob=f"{square}/{time}.csv")
+
+        blob_client.upload_blob(csv_string, blob_type="BlockBlob")
+        logging.info(f"uploaded {square}/{time}.csv to blob storage")
+
+def delete_latest_folder():
+    connection_string = os.environ["MyStorageAccountConnection"]
+    blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+    container_client = blob_service_client.get_container_client("csv")
+
+    try:
+        # List blobs with the specified prefix
+        blobs = container_client.walk_blobs(name_starts_with="latest/")
+
+        # Delete each blob
+        for blob in blobs:
+            container_client.get_blob_client(blob.name).delete_blob()
+
+        print(f"Folder 'latest/' deleted successfully.")
+    except Exception as e:
+        print(f"Error deleting folder 'latest/': {str(e)}")
