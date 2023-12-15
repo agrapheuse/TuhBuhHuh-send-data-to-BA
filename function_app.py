@@ -1,7 +1,6 @@
 import logging
 import azure.functions as func
 import pika
-import os
 from azure.storage.blob import BlobServiceClient
 from io import StringIO
 import pandas as pd
@@ -31,13 +30,18 @@ def sendDataToBA(myTimer: func.TimerRequest) -> None:
     connection_string = "DefaultEndpointsProtocol=https;AccountName=datalaketuhbehhuh;AccountKey=C2te9RgBRHhIH8u3tydAsn9wNd4umdD2axq1ZdcfKh7CZRpL04+D4H6QinE/gckMTUA/dFj1kFpd+ASt4+/8ZA==;EndpointSuffix=core.windows.net"
     blob_service_client = BlobServiceClient.from_connection_string(connection_string)
 
-    df = send_data_to_queue(blob_service_client)
-    if df.empty:
+    # send new data to business application
+    new_data_df = send_data_to_queue(blob_service_client)
+    if new_data_df.empty:
         return
-    pivoted_df = pivot_df(df)
-    upload_aggregated_data(blob_service_client, pivoted_df)
-    merge_aggregated_data(blob_service_client)
-    delete_latest_folder()
+    
+    # pivot the table so we have one column for each valueType
+    pivoted_df = pivot_df(new_data_df)
+    # upload the aggregated data to history folder
+    upload_new_data_to_blob_storage(blob_service_client, pivoted_df)
+    # merge the data in the history folder
+    merge_history_data(blob_service_client)
+    delete_folder(blob_service_client, "latest/")
 
 def send_data_to_queue(blob_service_client):
     # connect to rabbitmq using the right credentials
@@ -54,18 +58,17 @@ def send_data_to_queue(blob_service_client):
     # declare the queue
     queue_name = 'new_data_queue'
     channel.queue_declare(queue=queue_name, durable=True)
-    
+        
+    # get the grid from the blob storage
+    grid = download_blob_to_file(blob_service_client, "grid", "grid.csv")
+
     # get all the blobs names in the csv container
     container_client = blob_service_client.get_container_client("csv")
     blobs = container_client.list_blobs(name_starts_with="latest/")
-    
-    # get the grid from the blob storage
-    grid = download_blob_to_file(blob_service_client, "grid", "grid.csv")
 
     # for every blob, download it to a dataframe and add it to a list
     new_data = []
     for b in blobs:
-        print(b.name)
         df = download_blob_to_file(blob_service_client, "csv", b.name)
         new_data.append(df)
         logging.info(f"downloaded {b.name}")
@@ -139,41 +142,33 @@ def pivot_df(df):
     pivoted_df.reset_index(inplace=True)
     return pivoted_df
 
-def upload_aggregated_data(blob_service_client, df):
+def upload_new_data_to_blob_storage(blob_service_client, df):
     squares = df["squareUUID"].unique()
+    # loops through all the squares in the dataframe
     for square in squares:
+        # filter the dataframe to only have the data of the square
         square_df = df[df["squareUUID"] == square]
         time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         csv_string = square_df.to_csv(index=False)
+        # upload the data of the square to the history folder
         blob_client = blob_service_client.get_blob_client(container="csv/history", blob=f"{square}/{time}.csv")
 
         blob_client.upload_blob(csv_string, blob_type="BlockBlob")
         logging.info(f"uploaded {square}/{time}.csv to blob storage")
 
-def delete_latest_folder():
-    connection_string = os.environ["MyStorageAccountConnection"]
-    blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-    container_client = blob_service_client.get_container_client("csv")
-
-    try:
-        # List blobs with the specified prefix
-        blobs = container_client.walk_blobs(name_starts_with="latest/")
-
-        # Delete each blob
-        for blob in blobs:
-            container_client.get_blob_client(blob.name).delete_blob()
-
-        print(f"Folder 'latest/' deleted successfully.")
-    except Exception as e:
-        print(f"Error deleting folder 'latest/': {str(e)}")
-
-def merge_aggregated_data(blob_service_client):
+def merge_history_data(blob_service_client):
+    # list all the folders in the history folder
     folder_list = list_folders(blob_service_client, "csv")
-    print(folder_list)
+
+    # loop through all the folders
     for folder in folder_list:
+        # merge the data in the folder into one dataframe
         merged_data_df = merge_data(blob_service_client, folder)
+        # reformat the rows to have measurements at a 5 minute interval
         reformatted_time_df = merge_on_time(merged_data_df)
+        # delete the folder
         delete_folder(blob_service_client, folder)
+        # upload the merged data to the history folder
         upload_merged_data(blob_service_client, reformatted_time_df, folder)
 
 def list_folders(blob_service_client, container_name, folder_name="history/"):
@@ -192,10 +187,14 @@ def list_folders(blob_service_client, container_name, folder_name="history/"):
 
 def merge_data(blob_service_client, folder):
     container_client = blob_service_client.get_container_client("csv")
+    # List blobs in a folder
     blob_list = container_client.list_blobs(name_starts_with=folder)
     merged_df = pd.DataFrame(columns=["squareUUID", "timestamp", "BIKE", "CAR", "HEAVY", "HUMIDITY", "PEDESTRIAN", "PM10", "PM25", "TEMPERATURE"])
+    
     for blob in blob_list:
+        # download blob to dataframe
         df = download_blob_to_file(blob_service_client, "csv", blob.name)
+        # merge the dataframe with the others 
         merged_df = merge_two_df(merged_df, df)
     merged_df = merged_df.drop(columns="squareUUID", axis=1)
     return merged_df
@@ -213,7 +212,6 @@ def merge_on_time(df):
 
     # Reset the index to make 'timestamp' a regular column again
     resampled_data.reset_index(inplace=True)
-    print(resampled_data.columns)
     for col in resampled_data.columns[1:]:
         if resampled_data[col].dtype == 'float64':
             resampled_data[col] = resampled_data[col].round(1)
@@ -221,13 +219,14 @@ def merge_on_time(df):
 
 def delete_folder(blob_service_client, folder):
     container_client = blob_service_client.get_container_client("csv")
+    # List blobs in a folder
     blob_list = container_client.list_blobs(name_starts_with=folder)
     for blob in blob_list:
+        # foreach blob in the folder, delete it
         container_client.get_blob_client(blob.name).delete_blob()
     print(f"Folder '{folder}' deleted successfully.")
 
 def upload_merged_data(blob_service_client, df, folder):
-    container_client = blob_service_client.get_container_client("csv")
     csv_string = df.to_csv(index=False)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     blob_client = blob_service_client.get_blob_client(container="csv", blob=f"{folder}/{now}.csv")
