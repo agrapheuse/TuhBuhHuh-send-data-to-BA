@@ -1,5 +1,10 @@
 # Send Data To Business Application
 
+## What does this function app do ?
+
+Simply put, it takes the latest data from the data storage, merges it and formats it the correct way, sends the data to the business app through rabbit mq, and finally uploads it to the storage account in the history folder   
+Here are the steps that this function app follows:
+
 ## Step 1: Send data to business app: send_data_to_queue()
 
 This function is responsible for doing multiple things:

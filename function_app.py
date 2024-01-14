@@ -8,6 +8,7 @@ import json
 import uuid
 from enum import Enum
 from datetime import datetime
+from azure.servicebus import ServiceBusClient, ServiceBusMessage
 
 app = func.FunctionApp()
 
@@ -23,35 +24,37 @@ class EventHeader:
 
 # function triggers on a timer every 15 minutes
 @app.function_name(name="sendDataToBA")
-@app.schedule(schedule="* */5 * * *", arg_name="myTimer", run_on_startup=True,
+@app.schedule(schedule="0 */5 * * * *", arg_name="myTimer", run_on_startup=True,
               use_monitor=False) 
 def sendDataToBA(myTimer: func.TimerRequest) -> None:
-    logging.info('Python timer trigger function executed.')
+    logging.warning('Python timer trigger function executed.')
     connection_string = "DefaultEndpointsProtocol=https;AccountName=datalaketuhbehhuh;AccountKey=C2te9RgBRHhIH8u3tydAsn9wNd4umdD2axq1ZdcfKh7CZRpL04+D4H6QinE/gckMTUA/dFj1kFpd+ASt4+/8ZA==;EndpointSuffix=core.windows.net"
     blob_service_client = BlobServiceClient.from_connection_string(connection_string)
 
     # send new data to business application
     new_data_df = send_data_to_queue(blob_service_client)
     if new_data_df.empty:
+        logging.warning("no new data")
         return
     
     # pivot the table so we have one column for each valueType
     pivoted_df = pivot_df(new_data_df)
     # upload the aggregated data to history folder
     upload_new_data_to_blob_storage(blob_service_client, pivoted_df)
+    delete_folder(blob_service_client, "latest/")
     # merge the data in the history folder
     merge_history_data(blob_service_client)
-    delete_folder(blob_service_client, "latest/")
 
 def send_data_to_queue(blob_service_client):
     # connect to rabbitmq using the right credentials
     connection_params = pika.ConnectionParameters(
-        host='localhost',
-        port=5673,
-        virtual_host='/',
-        credentials=pika.PlainCredentials('myuser', 'mypassword')
+        host='goose.rmq2.cloudamqp.com',
+        port=5672,
+        virtual_host='ljbtjfzn',
+        credentials=pika.PlainCredentials('ljbtjfzn', 'v6hsm9rB5nI8FQnMQxRZUug081s_zPA3')
     )
 
+    logging.warning('connecting to rabbitmq')
     connection = pika.BlockingConnection(connection_params)
     channel = connection.channel()
 
@@ -60,6 +63,7 @@ def send_data_to_queue(blob_service_client):
     channel.queue_declare(queue=queue_name, durable=True)
         
     # get the grid from the blob storage
+    logging.warning('getting grid')
     grid = download_blob_to_file(blob_service_client, "grid", "grid.csv")
 
     # get all the blobs names in the csv container
@@ -71,10 +75,17 @@ def send_data_to_queue(blob_service_client):
     for b in blobs:
         df = download_blob_to_file(blob_service_client, "csv", b.name)
         new_data.append(df)
-        logging.info(f"downloaded {b.name}")
+        logging.warning(f"downloaded {b.name}")
     
     # concatenate all the dataframes into one big dataframe
     concatenated_data = concatenate_new_data(grid, new_data)
+
+    # remove the columns that are not needed by the business app
+    columns_to_drop = ['PEDESTRIAN', 'BIKE', 'V85', 'HEAVY']
+    columns_to_drop_existing = [col for col in columns_to_drop if col in concatenated_data.columns]
+
+    if columns_to_drop_existing:
+        concatenated_data = concatenated_data.drop(columns=columns_to_drop_existing)
 
     # convert the dataframe to dict
     data_list = concatenated_data.to_dict(orient='records')
@@ -92,14 +103,16 @@ def send_data_to_queue(blob_service_client):
     json_payload = json.dumps(event_message_dict)
 
     # send the event message to the queue
+    logging.warning(f"sending new data to queue {queue_name}")
     channel.basic_publish(exchange='', routing_key=queue_name, body=json_payload)
-    logging.info(f"sent new data to queue {queue_name}")
+    logging.warning(f"new data sent to queue {queue_name}")
 
     # close the connection
     connection.close()
     return concatenated_data
 
 def download_blob_to_file(blob_service_client: BlobServiceClient, container_name, blob_name):
+    logging.warning(f"downloading {blob_name} from blob storage")
     blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
     blob_data = blob_client.download_blob()
 
@@ -113,6 +126,7 @@ def concatenate_new_data(grid, new_data):
     concatenated_data = pd.DataFrame(columns=columns)
 
     # loop through all the squares in the grid
+    logging.warning("concatenating new data by square")
     for index, grid_row in grid.iterrows():
         # loop through all the dataframes
         for df in new_data:
@@ -151,10 +165,11 @@ def upload_new_data_to_blob_storage(blob_service_client, df):
         time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         csv_string = square_df.to_csv(index=False)
         # upload the data of the square to the history folder
+        logging.warning(f"uploading new data for square {square} to blob storage")
         blob_client = blob_service_client.get_blob_client(container="csv/history", blob=f"{square}/{time}.csv")
 
         blob_client.upload_blob(csv_string, blob_type="BlockBlob")
-        logging.info(f"uploaded {square}/{time}.csv to blob storage")
+        logging.warning(f"uploaded {square}/{time}.csv to blob storage")
 
 def merge_history_data(blob_service_client):
     # list all the folders in the history folder
@@ -170,6 +185,7 @@ def merge_history_data(blob_service_client):
         delete_folder(blob_service_client, folder)
         # upload the merged data to the history folder
         upload_merged_data(blob_service_client, reformatted_time_df, folder)
+        send_merge_data_to_anomaly_detection(f"{folder}/merged.csv")
 
 def list_folders(blob_service_client, container_name, folder_name="history/"):
     container_client = blob_service_client.get_container_client(container_name)
@@ -218,17 +234,37 @@ def merge_on_time(df):
     return resampled_data
 
 def delete_folder(blob_service_client, folder):
+    logging.warning(f"deleting folder {folder}")
     container_client = blob_service_client.get_container_client("csv")
     # List blobs in a folder
     blob_list = container_client.list_blobs(name_starts_with=folder)
     for blob in blob_list:
         # foreach blob in the folder, delete it
         container_client.get_blob_client(blob.name).delete_blob()
+    logging.warning(f"succesfully deleted folder {folder}")
     print(f"Folder '{folder}' deleted successfully.")
 
 def upload_merged_data(blob_service_client, df, folder):
     csv_string = df.to_csv(index=False)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    blob_client = blob_service_client.get_blob_client(container="csv", blob=f"{folder}/{now}.csv")
-    blob_client.upload_blob(csv_string, blob_type="BlockBlob")
-    logging.info(f"uploaded {folder}.csv to blob storage")
+    blob_client = blob_service_client.get_blob_client(container="csv", blob=f"{folder}/merged.csv")
+    blob_client.upload_blob(csv_string, blob_type="BlockBlob", overwrite=True)
+    logging.warning(f"uploaded {folder}.csv to blob storage")
+
+def send_merge_data_to_anomaly_detection(path):
+    connection_string = "Endpoint=sb://newdatafromapi.servicebus.windows.net/;SharedAccessKeyName=sendDataToBAsend;SharedAccessKey=mw2pdmHDd/z7uAVhs9BnfB+nFGEc5DB8U+ASbN6bil4="
+    queue_name = "agg-data-to-anomaly-detection"
+
+    # Create a ServiceBusClient using the connection string
+    logging.warning("connecting to service bus")
+    servicebus_client = ServiceBusClient.from_connection_string(conn_str=connection_string)
+
+    # Create a sender for the queue
+    sender = servicebus_client.get_queue_sender(queue_name=queue_name)
+
+    # Create a message
+    message = ServiceBusMessage(path)
+
+    # Send the message to the queue
+    logging.warning(f"sending {path} to service bus")
+    with sender:
+        sender.send_messages(message)
